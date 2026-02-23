@@ -1,673 +1,170 @@
-# 🤖 Slack AI Assistant v2
+# Learning How mini ClawBot Works
 
-> **An intelligent Slack bot powered by RAG (Retrieval Augmented Generation), Long-Term Memory, and MCP (Model Context Protocol) for GitHub & Notion integration.**
+This is my personal notebook for understanding how mini ClawBot is built. mini ClawBot is a Slack AI assistant that goes far beyond a basic chatbot. It can search through past Slack conversations, remember who you are across sessions, and take real actions on GitHub and Notion.
 
-[![Node.js](https://img.shields.io/badge/Node.js-18%2B-green.svg)](https://nodejs.org/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-blue.svg)](https://www.typescriptlang.org/)
-[![Slack](https://img.shields.io/badge/Slack-Bolt.js-purple.svg)](https://slack.dev/bolt-js/)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+I went through this codebase step by step to understand how all three of these systems fit together inside a single bot.
 
 ---
 
-## 📋 Table of Contents
+## What mini ClawBot Actually Does
 
-- [Overview](#-overview)
-- [Features](#-features)
-- [Architecture](#-architecture)
-  - [High-Level Architecture](#high-level-architecture)
-  - [Component Deep Dive](#component-deep-dive)
-- [How It Works](#-how-it-works)
-  - [Message Processing Flow](#message-processing-flow)
-  - [RAG System](#1-rag-retrieval-augmented-generation)
-  - [Memory System](#2-memory-system-mem0)
-  - [MCP Integration](#3-mcp-model-context-protocol)
-- [Installation](#-installation)
-- [Configuration](#-configuration)
-- [Usage Examples](#-usage-examples)
-- [Available Tools](#-available-tools)
-- [Project Structure](#-project-structure)
-- [Troubleshooting](#-troubleshooting)
-- [Contributing](#-contributing)
-- [License](#-license)
+Before diving into the code, I first tried to understand what makes mini ClawBot different from a simple chatbot.
+
+A basic chatbot works like this every single time:
+
+```
+User Message → LLM → Reply
+```
+
+It has no memory of past conversations. It has no knowledge of what happened before. It cannot take actions in the real world.
+
+mini ClawBot works like this:
+
+```
+User Message
+    │
+    ├── Step 1: Recall what is known about this user from past sessions (Memory)
+    ├── Step 2: Search old Slack messages for relevant context (RAG)
+    └── Step 3: Load last 10 messages from this conversation (Session)
+              │
+              ▼
+         LLM sees everything above + has 59 tools available
+              │
+    ├── 12 Slack tools  (search messages, send, schedule, reminders, memory ops)
+    ├── 26 GitHub tools (repos, issues, PRs, file contents, code search)
+    └── 21 Notion tools (pages, databases, search, create, update)
+              │
+              ▼
+         Sends reply to Slack + saves new facts to memory in the background
+```
+
+That is the mental model I kept coming back to while reading the code.
 
 ---
 
-## 🌟 Overview
+## The 3 Systems I Studied
 
-This Slack AI Assistant is a production-grade conversational AI that combines three powerful systems:
+### System 1: RAG (How mini ClawBot Searches Slack History)
 
-| System | Purpose | Technology |
-|--------|---------|------------|
-| **RAG** | Search & retrieve historical Slack messages | Vector embeddings + Semantic search |
-| **Memory** | Remember user preferences & context across sessions | mem0.ai cloud |
-| **MCP** | Interact with external tools (GitHub, Notion) | Model Context Protocol |
+RAG stands for Retrieval Augmented Generation. This was the first system I tried to understand because it felt the most unfamiliar.
 
-### What Makes This Special?
+**The core idea:** Instead of asking the LLM to remember what was said in Slack (it cannot, it has no access), mini ClawBot indexes Slack messages into a local vector database. When a user asks something like "what did we discuss about the API last week?", it searches that database and hands the actual messages to the LLM as context.
+
+**How indexing works (runs every 60 minutes in the background):**
 
 ```
-Traditional Bot:  User → LLM → Response (no context, no memory, no tools)
-
-This Bot:         User → Memory Recall → RAG Context → LLM + 59 Tools → Action → Memory Storage
-                         ↓                ↓                    ↓
-                   "User prefers..."  "In Slack on Oct 5..."  "Created GitHub issue #42"
+Slack Channels
+    → Fetch new messages
+    → Convert each message to a vector using OpenAI text-embedding-3-small (1536 dimensions)
+    → Store vectors + metadata in ChromaDB on local disk
 ```
+
+**How search works (happens right before the LLM is called):**
+
+```
+User Query
+    → Convert query to a vector using the same embedding model
+    → Find the most similar vectors in ChromaDB using cosine similarity
+    → Return the top matching Slack messages
+    → Add those messages to the LLM context
+```
+
+mini ClawBot also checks the user's message for keywords like "discussed", "talked about", "mentioned", "said" before deciding whether to run the RAG search at all.
+
+**Files I read to understand this:**
+
+| File | What it does |
+|------|-------------|
+| [src/rag/indexer.ts](src/rag/indexer.ts) | Fetches Slack messages and creates embeddings on a schedule |
+| [src/rag/vectorstore.ts](src/rag/vectorstore.ts) | Reads and writes to the ChromaDB vector database |
+| [src/rag/retriever.ts](src/rag/retriever.ts) | Takes a query and returns matching messages |
+| [src/rag/embeddings.ts](src/rag/embeddings.ts) | Handles the OpenAI embedding API calls |
+
+**What clicked for me:** The reason RAG works is that meaning is preserved in vectors. Two sentences that say the same thing in different words will have similar vectors. That is why you can search by meaning rather than exact keywords.
 
 ---
 
-## ✨ Features
+### System 2: Memory (How mini ClawBot Remembers Users)
 
-### 🔍 RAG (Retrieval Augmented Generation)
-- **Semantic search** across indexed Slack messages
-- **Background indexing** of channels (runs every 60 minutes)
-- **Smart retrieval** with relevance scoring
-- Works even when bot can't access live channel
+This system surprised me the most. mini ClawBot uses a cloud service called mem0 that automatically extracts facts from conversations and stores them per user ID.
 
-### 🧠 Long-Term Memory
-- **Automatic fact extraction** from conversations
-- **Personalized responses** based on user history
-- **User-controlled** - view, add, or delete memories
-- **Cross-session persistence** - remembers across conversations
+**How memory gets saved (runs after every reply, in the background):**
 
-### 🔌 MCP (Model Context Protocol)
-- **GitHub Integration** (26 tools)
-  - Search repositories, create issues, read files
-  - List PRs, commits, manage code
-- **Notion Integration** (21 tools)
-  - Search pages, query databases
-  - Read and update content
+```
+Full conversation text
+    → Sent to mem0 API
+    → mem0 uses a small model internally to extract facts
+    → Facts are stored and linked to this user's ID
+```
 
-### 💬 Slack Features
-- **DM conversations** with pairing/approval system
-- **Channel mentions** with @bot
-- **Thread summarization** with `/summarize`
-- **Message scheduling** and reminders
-- **Typing indicators** and reactions
+Example facts mini ClawBot might extract:
+- "User prefers concise responses"
+- "User's GitHub username is myusername"
+- "User is working on a recommendation system project"
+
+**How memory gets used (runs before every LLM call):**
+
+```
+User's message + their user ID
+    → Sent to mem0 as a search query
+    → mem0 returns facts that are relevant to this message
+    → Those facts are added to the LLM's system prompt
+```
+
+So if you told mini ClawBot your GitHub username two weeks ago, it will automatically use that username when you ask it to list your repos today, without you having to repeat yourself.
+
+**Files I read to understand this:**
+
+| File | What it does |
+|------|-------------|
+| [src/memory-ai/mem0-client.ts](src/memory-ai/mem0-client.ts) | All the mem0 API calls: add, search, delete memories |
+| [src/memory-ai/index.ts](src/memory-ai/index.ts) | Re-exports memory functions for use in the agent |
+
+**Users can also control their own memory by telling mini ClawBot:**
+
+```
+"What do you remember about me?"    → shows stored facts
+"Remember that I prefer Python"     → saves a fact manually
+"Forget about my old project"       → deletes a specific memory
+"Forget everything about me"        → clears all memories
+```
+
+**What clicked for me:** Memory storage happens asynchronously after the response is sent. That means the user gets a fast reply and the memory extraction happens quietly in the background. Smart tradeoff.
 
 ---
 
-## 🏗 Architecture
+### System 3: MCP (How mini ClawBot Uses GitHub and Notion)
 
-### High-Level Architecture
+MCP stands for Model Context Protocol. It is an open standard from Anthropic for connecting AI models to external tools without hardcoding each integration.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              SLACK WORKSPACE                                     │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐            │
-│  │  #general   │  │  #dev-team  │  │    DMs      │  │  @mentions  │            │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘            │
-└─────────┼────────────────┼────────────────┼────────────────┼────────────────────┘
-          │                │                │                │
-          └────────────────┴────────────────┴────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           SLACK BOLT.JS (Socket Mode)                            │
-│                              Event Handler Layer                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              AI AGENT (GPT-4o)                                   │
-│  ┌─────────────────────────────────────────────────────────────────────────┐   │
-│  │                         CONTEXT ASSEMBLY                                 │   │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                   │   │
-│  │  │   MEMORY     │  │     RAG      │  │   SESSION    │                   │   │
-│  │  │   CONTEXT    │  │   CONTEXT    │  │   HISTORY    │                   │   │
-│  │  │              │  │              │  │              │                   │   │
-│  │  │ "User is     │  │ "On Oct 5,   │  │ Last 10      │                   │   │
-│  │  │  co-founder  │  │  team said   │  │ messages     │                   │   │
-│  │  │  of Vizuara" │  │  about..."   │  │ in thread    │                   │   │
-│  │  └──────────────┘  └──────────────┘  └──────────────┘                   │   │
-│  └─────────────────────────────────────────────────────────────────────────┘   │
-│                                    │                                            │
-│                                    ▼                                            │
-│  ┌─────────────────────────────────────────────────────────────────────────┐   │
-│  │                         59 AVAILABLE TOOLS                               │   │
-│  │  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐             │   │
-│  │  │  SLACK TOOLS   │  │  GITHUB TOOLS  │  │  NOTION TOOLS  │             │   │
-│  │  │   (12 tools)   │  │   (26 tools)   │  │   (21 tools)   │             │   │
-│  │  │                │  │                │  │                │             │   │
-│  │  │ • search_kb    │  │ • create_issue │  │ • search       │             │   │
-│  │  │ • send_message │  │ • list_repos   │  │ • get_page     │             │   │
-│  │  │ • get_history  │  │ • get_file     │  │ • query_db     │             │   │
-│  │  │ • schedule     │  │ • list_PRs     │  │ • create_page  │             │   │
-│  │  │ • remind       │  │ • search_code  │  │ • update       │             │   │
-│  │  │ • memory ops   │  │ • ...          │  │ • ...          │             │   │
-│  │  └────────────────┘  └────────────────┘  └────────────────┘             │   │
-│  └─────────────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────────┘
-                                    │
-          ┌─────────────────────────┼─────────────────────────┐
-          ▼                         ▼                         ▼
-┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
-│   VECTOR STORE   │    │   MEM0 CLOUD     │    │   MCP SERVERS    │
-│   (ChromaDB)     │    │                  │    │                  │
-│                  │    │                  │    │  ┌────────────┐  │
-│  254 indexed     │    │  User memories   │    │  │   GitHub   │  │
-│  Slack messages  │    │  & preferences   │    │  │   Server   │  │
-│                  │    │                  │    │  └────────────┘  │
-│  Embeddings:     │    │  Extraction:     │    │  ┌────────────┐  │
-│  OpenAI          │    │  gpt-4o-mini     │    │  │   Notion   │  │
-│  text-embed-3    │    │                  │    │  │   Server   │  │
-│                  │    │                  │    │  └────────────┘  │
-└──────────────────┘    └──────────────────┘    └──────────────────┘
-          │                         │                         │
-          │                         │                         │
-          ▼                         ▼                         ▼
-┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
-│   LOCAL DISK     │    │   MEM0 API       │    │  EXTERNAL APIs   │
-│   ./data/        │    │   (Cloud)        │    │  GitHub, Notion  │
-└──────────────────┘    └──────────────────┘    └──────────────────┘
-```
+**The idea:** Instead of writing GitHub API code directly inside mini ClawBot, you run a separate GitHub MCP server process. mini ClawBot talks to that process over stdin/stdout using JSON-RPC. The server handles all the actual API calls.
 
----
-
-### Component Deep Dive
-
-#### 1. Slack Layer (`src/channels/slack.ts`)
+**How it looks at startup:**
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    SLACK EVENT HANDLER                          │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  INCOMING EVENTS:                                               │
-│  ├── message (DM)        → Check approval → Process             │
-│  ├── message (channel)   → Check @mention → Process             │
-│  ├── app_mention         → Process directly                     │
-│  ├── reaction_added      → Log/handle                           │
-│  └── slash_commands      → /approve, /status                    │
-│                                                                 │
-│  SPECIAL HANDLERS:                                              │
-│  ├── "help"              → Show help message                    │
-│  ├── "summarize"/"tldr"  → Summarize thread                     │
-│  ├── "my tasks"          → List scheduled tasks                 │
-│  ├── "cancel task N"     → Cancel task                          │
-│  └── "/reset"            → Clear conversation                   │
-│                                                                 │
-│  REGULAR FLOW:                                                  │
-│  └── All other messages  → processMessage() in agent.ts        │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+mini ClawBot starts
+    → Spawns a GitHub MCP server process (via npx)
+    → Spawns a Notion MCP server process (via npx)
+    → Asks each: "what tools do you have?" (tools/list)
+    → Registers all discovered tools alongside the built-in Slack tools
+    → LLM now sees all 59 tools total
 ```
 
-#### 2. Agent Layer (`src/agents/agent.ts`)
+**When a tool is called:**
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                      AI AGENT                                    │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  processMessage(userMessage, context)                           │
-│  │                                                              │
-│  ├── 1. MEMORY RETRIEVAL                                        │
-│  │   └── searchMemory(message, userId) → memoryContext          │
-│  │                                                              │
-│  ├── 2. RAG PRE-CHECK                                           │
-│  │   └── shouldUseRAG(message) ? retrieve() → ragContext        │
-│  │                                                              │
-│  ├── 3. BUILD MESSAGES                                          │
-│  │   ├── System prompt (with tool instructions)                 │
-│  │   ├── Memory context (if found)                              │
-│  │   ├── RAG context (if found)                                 │
-│  │   ├── Session history (last 10 messages)                     │
-│  │   └── Current user message                                   │
-│  │                                                              │
-│  ├── 4. GET ALL TOOLS                                           │
-│  │   ├── SLACK_TOOLS (12 built-in)                              │
-│  │   └── MCP_TOOLS (47 from GitHub + Notion)                    │
-│  │                                                              │
-│  ├── 5. LLM CALL (GPT-4o)                                       │
-│  │   └── Loop while tool_calls exist:                           │
-│  │       ├── Execute tool (Slack or MCP)                        │
-│  │       ├── Add result to messages                             │
-│  │       └── Call LLM again                                     │
-│  │                                                              │
-│  ├── 6. MEMORY STORAGE (async, background)                      │
-│  │   └── addMemory(conversation) → extract & store facts        │
-│  │                                                              │
-│  └── 7. RETURN RESPONSE                                         │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+LLM decides to call github_create_issue
+    → mini ClawBot parses the tool name: server = "github", tool = "create_issue"
+    → Sends a JSON-RPC request to the GitHub MCP server process
+    → Server calls the real GitHub API
+    → Returns the result back to mini ClawBot
+    → mini ClawBot feeds the result back to the LLM
+    → LLM generates the next response
 ```
 
-#### 3. Tool Execution Flow
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                   TOOL EXECUTION                                 │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  executeTool(name, args, context)                               │
-│  │                                                              │
-│  ├── SLACK TOOLS (handled directly):                            │
-│  │   ├── search_knowledge_base → RAG retrieve()                 │
-│  │   ├── send_message → Slack API                               │
-│  │   ├── get_channel_history → Slack API                        │
-│  │   ├── schedule_message → Slack API                           │
-│  │   ├── set_reminder → Slack API                               │
-│  │   ├── list_channels → Slack API                              │
-│  │   ├── list_users → Slack API                                 │
-│  │   ├── get_my_memories → mem0 getAllMemories()                │
-│  │   ├── remember_this → mem0 addMemory()                       │
-│  │   ├── forget_about → mem0 deleteMemory()                     │
-│  │   └── forget_everything → mem0 deleteAllMemories()           │
-│  │                                                              │
-│  └── MCP TOOLS (routed to MCP servers):                         │
-│      │                                                          │
-│      ├── parseToolName("github_create_issue")                   │
-│      │   └── { serverName: "github", toolName: "create_issue" } │
-│      │                                                          │
-│      └── executeMCPTool(serverName, toolName, args)             │
-│          └── Send JSON-RPC to MCP server process                │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🔄 How It Works
-
-### Message Processing Flow
-
-When a user sends a message, here's the complete flow:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ USER: "Search Slack for bugs we discussed, then create GitHub issues for them" │
-└─────────────────────────────────────────────────────────────────────────────────┘
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ STEP 1: SLACK EVENT RECEIVED                                                    │
-│ ────────────────────────────                                                    │
-│ • Slack Bolt.js receives message event                                          │
-│ • Validates: Is this a DM? Is user approved? Is bot mentioned?                  │
-│ • Adds 👀 reaction to show processing                                           │
-│ • Creates/retrieves session for conversation continuity                         │
-│                                                                                 │
-│ Log: "Message received from U050Y4SNQF3 in D0AB0RYJTRR"                         │
-└─────────────────────────────────────────────────────────────────────────────────┘
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ STEP 2: MEMORY RETRIEVAL                                                        │
-│ ────────────────────────                                                        │
-│ • Query mem0 for relevant memories about this user                              │
-│ • Semantic search: "What do I know that's relevant to this message?"            │
-│ • Returns: User preferences, past context, stored facts                         │
-│                                                                                 │
-│ Example memories found:                                                         │
-│ • "User's GitHub username is VizuaraAI"                                         │
-│ • "User prefers detailed technical explanations"                                │
-│ • "User is co-founder of Vizuara AI Labs"                                       │
-│                                                                                 │
-│ Log: "Retrieved 3 relevant memories"                                            │
-└─────────────────────────────────────────────────────────────────────────────────┘
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ STEP 3: RAG PRE-CHECK                                                           │
-│ ─────────────────────                                                           │
-│ • Analyze message: Does it ask about past discussions?                          │
-│ • Keywords: "discussed", "talked about", "mentioned", "said", etc.              │
-│ • If yes: Query vector store for relevant Slack messages                        │
-│                                                                                 │
-│ • Query: "bugs we discussed"                                                    │
-│ • Vector search across 254 indexed messages                                     │
-│ • Returns top matches with relevance scores                                     │
-│                                                                                 │
-│ Log: "RAG triggered for query"                                                  │
-│ Log: "Retrieved 5 documents in 384ms"                                           │
-└─────────────────────────────────────────────────────────────────────────────────┘
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ STEP 4: BUILD LLM CONTEXT                                                       │
-│ ─────────────────────────                                                       │
-│                                                                                 │
-│ Messages array sent to GPT-4o:                                                  │
-│                                                                                 │
-│ [                                                                               │
-│   {                                                                             │
-│     role: "system",                                                             │
-│     content: "You are a helpful AI assistant...                                 │
-│               ## MANDATORY TOOL USAGE...                                        │
-│               You have access to GitHub and Notion via tools..."                │
-│   },                                                                            │
-│   {                                                                             │
-│     role: "system",                                                             │
-│     content: "## What I Remember About You\n                                    │
-│               1. User's GitHub username is VizuaraAI\n                          │
-│               2. User prefers detailed explanations..."                         │
-│   },                                                                            │
-│   {                                                                             │
-│     role: "system",                                                             │
-│     content: "## Relevant Slack History\n                                       │
-│               [Oct 5] @john: Found a bug in the login flow...\n                 │
-│               [Oct 7] @jane: The API timeout issue is critical..."              │
-│   },                                                                            │
-│   { role: "user", content: "What's the weather?" },      // Previous           │
-│   { role: "assistant", content: "I can't check..." },    // conversation       │
-│   { role: "user", content: "Search Slack for bugs..." }  // Current message    │
-│ ]                                                                               │
-│                                                                                 │
-│ + 59 tool definitions attached                                                  │
-│                                                                                 │
-│ Log: "Total tools available: 59 (12 Slack + 47 MCP)"                            │
-│ Log: "Calling LLM with 59 tools"                                                │
-└─────────────────────────────────────────────────────────────────────────────────┘
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ STEP 5: LLM DECISION & TOOL CALLS                                               │
-│ ─────────────────────────────────                                               │
-│                                                                                 │
-│ GPT-4o analyzes the request and decides to call tools:                          │
-│                                                                                 │
-│ ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│ │ LLM Response #1:                                                            │ │
-│ │ {                                                                           │ │
-│ │   tool_calls: [                                                             │ │
-│ │     {                                                                       │ │
-│ │       function: "search_knowledge_base",                                    │ │
-│ │       arguments: { query: "bugs", limit: 10 }                               │ │
-│ │     }                                                                       │ │
-│ │   ]                                                                         │ │
-│ │ }                                                                           │ │
-│ └─────────────────────────────────────────────────────────────────────────────┘ │
-│                                        │                                        │
-│                                        ▼                                        │
-│ ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│ │ TOOL EXECUTION: search_knowledge_base                                       │ │
-│ │ • RAG query: "bugs"                                                         │ │
-│ │ • Returns: 10 relevant messages about bugs                                  │ │
-│ │                                                                             │ │
-│ │ Log: "Executing tool: search_knowledge_base"                                │ │
-│ │ Log: "RAG search returned 10 results"                                       │ │
-│ └─────────────────────────────────────────────────────────────────────────────┘ │
-│                                        │                                        │
-│                                        ▼                                        │
-│ ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│ │ LLM Response #2 (with tool results):                                        │ │
-│ │ {                                                                           │ │
-│ │   tool_calls: [                                                             │ │
-│ │     {                                                                       │ │
-│ │       function: "github_create_issue",                                      │ │
-│ │       arguments: {                                                          │ │
-│ │         owner: "VizuaraAI",                                                 │ │
-│ │         repo: "nano-kimi",                                                  │ │
-│ │         title: "Fix login timeout bug",                                     │ │
-│ │         body: "As discussed on Oct 5..."                                    │ │
-│ │       }                                                                     │ │
-│ │     },                                                                      │ │
-│ │     {                                                                       │ │
-│ │       function: "github_create_issue",                                      │ │
-│ │       arguments: { ... another issue ... }                                  │ │
-│ │     }                                                                       │ │
-│ │   ]                                                                         │ │
-│ │ }                                                                           │ │
-│ └─────────────────────────────────────────────────────────────────────────────┘ │
-│                                        │                                        │
-│                                        ▼                                        │
-│ ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│ │ TOOL EXECUTION: github_create_issue (via MCP)                               │ │
-│ │ • Route to MCP client                                                       │ │
-│ │ • MCP client sends JSON-RPC to GitHub server                                │ │
-│ │ • GitHub server calls GitHub API                                            │ │
-│ │ • Returns: { issue_number: 42, url: "..." }                                 │ │
-│ │                                                                             │ │
-│ │ Log: "Executing MCP tool: github/create_issue"                              │ │
-│ └─────────────────────────────────────────────────────────────────────────────┘ │
-│                                        │                                        │
-│                                        ▼                                        │
-│ ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│ │ LLM Response #3 (final):                                                    │ │
-│ │ {                                                                           │ │
-│ │   content: "I searched Slack and found 10 discussions about bugs.           │ │
-│ │             I've created 2 GitHub issues:\n                                 │ │
-│ │             • #42: Fix login timeout bug\n                                  │ │
-│ │             • #43: API response caching issue"                              │ │
-│ │ }                                                                           │ │
-│ └─────────────────────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────────────┘
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ STEP 6: MEMORY STORAGE (Background)                                             │
-│ ───────────────────────────────────                                             │
-│                                                                                 │
-│ • After response is sent, analyze conversation for facts                        │
-│ • mem0 extracts: "User asked about bugs in Slack discussions"                   │
-│ • Stores for future context                                                     │
-│                                                                                 │
-│ Log: "Stored 1 memories for user U050Y4SNQF3"                                   │
-└─────────────────────────────────────────────────────────────────────────────────┘
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ STEP 7: SEND RESPONSE                                                           │
-│ ─────────────────────                                                           │
-│                                                                                 │
-│ • Remove 👀 reaction                                                            │
-│ • Send formatted response to Slack                                              │
-│ • Thread if needed (long response or existing thread)                           │
-│                                                                                 │
-│ Final message to user:                                                          │
-│ "I searched Slack and found 10 discussions about bugs.                          │
-│  I've created 2 GitHub issues:                                                  │
-│  • #42: Fix login timeout bug                                                   │
-│  • #43: API response caching issue"                                             │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-### 1. RAG (Retrieval Augmented Generation)
-
-#### What is RAG?
-
-RAG allows the bot to search through historical Slack messages and use them as context for responses. Instead of the LLM making up information, it retrieves real data from your workspace.
-
-#### How RAG Works
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              RAG PIPELINE                                        │
-└─────────────────────────────────────────────────────────────────────────────────┘
-
-                            INDEXING PHASE (Background)
-                            ═══════════════════════════
-
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│    SLACK     │     │   MESSAGE    │     │  EMBEDDING   │     │   VECTOR     │
-│   CHANNELS   │────▶│  EXTRACTOR   │────▶│   MODEL      │────▶│    STORE     │
-│              │     │              │     │              │     │              │
-│ #general     │     │ • Text       │     │ OpenAI       │     │ ChromaDB     │
-│ #dev-team    │     │ • User       │     │ text-embed-  │     │ (Local)      │
-│ #random      │     │ • Timestamp  │     │ 3-small      │     │              │
-│              │     │ • Channel    │     │              │     │ 254 docs     │
-│              │     │ • Thread     │     │ 1536 dims    │     │ indexed      │
-└──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
-
-                            RETRIEVAL PHASE (Query Time)
-                            ════════════════════════════
-
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│    USER      │     │  EMBEDDING   │     │   VECTOR     │     │   RANKED     │
-│    QUERY     │────▶│   MODEL      │────▶│   SEARCH     │────▶│   RESULTS    │
-│              │     │              │     │              │     │              │
-│ "What bugs   │     │ Same model   │     │ Cosine       │     │ Top 10 most  │
-│  did we      │     │ as indexing  │     │ similarity   │     │ relevant     │
-│  discuss?"   │     │              │     │              │     │ messages     │
-└──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
-```
-
-#### RAG Configuration
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `RAG_ENABLED` | `true` | Enable/disable RAG |
-| `RAG_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI embedding model |
-| `RAG_MAX_RESULTS` | `10` | Max documents to retrieve |
-| `RAG_MIN_SIMILARITY` | `0.3` | Minimum relevance score (0-1) |
-| `RAG_INDEX_INTERVAL_MINUTES` | `60` | How often to re-index |
-
-#### Key Files
-
-- `src/rag/vectorstore.ts` - Vector storage (ChromaDB)
-- `src/rag/embeddings.ts` - OpenAI embeddings
-- `src/rag/indexer.ts` - Background message indexer
-- `src/rag/retriever.ts` - Semantic search
-
----
-
-### 2. Memory System (mem0)
-
-#### What is mem0?
-
-mem0 is a cloud-based memory system that automatically extracts and stores facts from conversations. It enables the bot to remember user preferences, context, and history across sessions.
-
-#### How Memory Works
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                            MEMORY PIPELINE                                       │
-└─────────────────────────────────────────────────────────────────────────────────┘
-
-                            STORAGE PHASE (After Response)
-                            ══════════════════════════════
-
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│ CONVERSATION │     │    GPT-4o    │     │    FACT      │     │   MEM0       │
-│              │────▶│    MINI      │────▶│  EXTRACTION  │────▶│   CLOUD      │
-│              │     │              │     │              │     │              │
-│ User: "My    │     │ Analyzes     │     │ Extracted:   │     │ Stores per   │
-│  GitHub is   │     │ conversation │     │ "User's      │     │ user_id      │
-│  VizuaraAI"  │     │ for facts    │     │  GitHub is   │     │              │
-│              │     │              │     │  VizuaraAI"  │     │ Searchable   │
-│ Bot: "Got    │     │              │     │              │     │ via API      │
-│  it!"        │     │              │     │              │     │              │
-└──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
-
-                            RETRIEVAL PHASE (Before LLM Call)
-                            ═════════════════════════════════
-
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│    USER      │     │   MEM0       │     │  SEMANTIC    │     │  MEMORY      │
-│   MESSAGE    │────▶│   CLOUD      │────▶│   SEARCH     │────▶│  CONTEXT     │
-│              │     │              │     │              │     │              │
-│ "List my     │     │ Query by     │     │ Find         │     │ "User's      │
-│  repos"      │     │ user_id +    │     │ relevant     │     │  GitHub is   │
-│              │     │ semantic     │     │ memories     │     │  VizuaraAI"  │
-└──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
-                                                                      │
-                                                                      ▼
-                                                              Added to LLM context
-```
-
-#### Memory Types
-
-| Type | Example | How It's Used |
-|------|---------|---------------|
-| **Preferences** | "User prefers concise responses" | Adjusts response style |
-| **Identity** | "User is co-founder of Vizuara" | Personalizes context |
-| **Technical** | "User's GitHub is VizuaraAI" | Pre-fills tool arguments |
-| **Projects** | "User is working on nano-kimi" | Understands context |
-| **Interests** | "User cares about SOP, LOR" | Prioritizes topics |
-
-#### Memory Tools (User-Controlled)
-
-```
-"What do you remember about me?"     → get_my_memories
-"Remember that I prefer Python"      → remember_this
-"Forget about my old project"        → forget_about
-"Forget everything about me"         → forget_everything
-```
-
----
-
-### 3. MCP (Model Context Protocol)
-
-#### What is MCP?
-
-MCP is Anthropic's open standard for connecting AI models to external tools. Instead of hardcoding integrations, MCP provides a standardized protocol for tool discovery and execution.
-
-#### How MCP Works
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              MCP ARCHITECTURE                                    │
-└─────────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              SLACK BOT PROCESS                                   │
-│                                                                                 │
-│  ┌─────────────────────────────────────────────────────────────────────────┐   │
-│  │                           MCP CLIENT                                     │   │
-│  │                        (src/mcp/client.ts)                               │   │
-│  │                                                                          │   │
-│  │   • Spawns MCP server processes                                          │   │
-│  │   • Discovers available tools                                            │   │
-│  │   • Routes tool calls via JSON-RPC                                       │   │
-│  │   • Handles responses                                                    │   │
-│  └─────────────────────────────────────────────────────────────────────────┘   │
-│                                    │                                            │
-│                    ┌───────────────┴───────────────┐                           │
-│                    │           stdio               │                            │
-│                    │      (stdin/stdout)           │                            │
-│                    ▼                               ▼                            │
-│  ┌──────────────────────────────┐  ┌──────────────────────────────┐           │
-│  │      GITHUB MCP SERVER       │  │      NOTION MCP SERVER       │           │
-│  │                              │  │                              │           │
-│  │  npx @modelcontextprotocol/  │  │  npx @notionhq/              │           │
-│  │      server-github           │  │      notion-mcp-server       │           │
-│  │                              │  │                              │           │
-│  │  26 tools available:         │  │  21 tools available:         │           │
-│  │  • search_repositories       │  │  • search                    │           │
-│  │  • create_issue              │  │  • get_page                  │           │
-│  │  • get_file_contents         │  │  • query_database            │           │
-│  │  • list_pull_requests        │  │  • create_page               │           │
-│  │  • ...                       │  │  • ...                       │           │
-│  └──────────────────────────────┘  └──────────────────────────────┘           │
-│                    │                               │                            │
-└────────────────────┼───────────────────────────────┼────────────────────────────┘
-                     │                               │
-                     ▼                               ▼
-           ┌──────────────────┐            ┌──────────────────┐
-           │   GITHUB API     │            │   NOTION API     │
-           │                  │            │                  │
-           │  api.github.com  │            │  api.notion.com  │
-           └──────────────────┘            └──────────────────┘
-```
-
-#### MCP Initialization Flow
-
-```
-STARTUP:
-────────
-1. Load config (env vars or mcp-config.json)
-2. For each server:
-   a. Spawn process: npx @modelcontextprotocol/server-xxx
-   b. Send: initialize request
-   c. Send: notifications/initialized
-   d. Send: tools/list
-   e. Store discovered tools
-
-TOOL CALL:
-──────────
-1. LLM returns: { tool: "github_create_issue", args: {...} }
-2. Parse: serverName="github", toolName="create_issue"
-3. Find server process
-4. Send JSON-RPC: { method: "tools/call", params: { name, arguments } }
-5. Wait for response
-6. Return result to LLM
-```
-
-#### JSON-RPC Communication
+**Example JSON-RPC message mini ClawBot sends to the GitHub server:**
 
 ```json
-// Request (Bot → MCP Server)
 {
   "jsonrpc": "2.0",
   "id": 1,
@@ -675,523 +172,256 @@ TOOL CALL:
   "params": {
     "name": "create_issue",
     "arguments": {
-      "owner": "VizuaraAI",
-      "repo": "nano-kimi",
-      "title": "Fix bug",
-      "body": "Description..."
+      "owner": "your-username",
+      "repo": "your-repo",
+      "title": "Fix login timeout bug",
+      "body": "As discussed on Oct 5..."
     }
   }
 }
-
-// Response (MCP Server → Bot)
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "result": {
-    "content": [
-      {
-        "type": "text",
-        "text": "Created issue #42: https://github.com/..."
-      }
-    ]
-  }
-}
 ```
 
----
+**Files I read to understand this:**
 
-## 📦 Installation
-
-### Prerequisites
-
-- Node.js 18+
-- npm or yarn
-- Slack workspace (admin access)
-- OpenAI API key
-- GitHub Personal Access Token (for MCP)
-- Notion Integration Token (for MCP)
-- mem0 API key (for memory)
-
-### Step 1: Clone & Install
-
-```bash
-git clone https://github.com/yourusername/slack-ai-assistant-v2.git
-cd slack-ai-assistant-v2
-npm install
-```
-
-### Step 2: Create Slack App
-
-1. Go to [api.slack.com/apps](https://api.slack.com/apps)
-2. Click "Create New App" → "From scratch"
-3. Enable **Socket Mode** (Settings → Socket Mode)
-4. Add **Bot Token Scopes**:
-   - `app_mentions:read`
-   - `channels:history`
-   - `channels:read`
-   - `chat:write`
-   - `im:history`
-   - `im:read`
-   - `im:write`
-   - `reactions:read`
-   - `reactions:write`
-   - `reminders:read`
-   - `reminders:write`
-   - `users:read`
-5. Add **User Token Scopes** (for reminders):
-   - `reminders:read`
-   - `reminders:write`
-6. Install to workspace
-7. Copy tokens:
-   - Bot Token: `xoxb-...`
-   - App Token: `xapp-...`
-   - User Token: `xoxp-...`
-
-### Step 3: Get API Keys
-
-**OpenAI:**
-1. Go to [platform.openai.com](https://platform.openai.com)
-2. Create API key
-
-**GitHub:**
-1. Go to [github.com/settings/tokens](https://github.com/settings/tokens)
-2. Generate new token (classic)
-3. Select scopes: `repo`, `issues`
-
-**Notion:**
-1. Go to [notion.so/my-integrations](https://www.notion.so/my-integrations)
-2. Create new integration
-3. Copy Internal Integration Token
-4. Share pages with the integration
-
-**mem0:**
-1. Go to [app.mem0.ai](https://app.mem0.ai)
-2. Create account and get API key
-
-### Step 4: Configure Environment
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env`:
-```env
-# Slack
-SLACK_BOT_TOKEN=xoxb-your-bot-token
-SLACK_APP_TOKEN=xapp-your-app-token
-SLACK_USER_TOKEN=xoxp-your-user-token
-
-# AI
-OPENAI_API_KEY=sk-your-openai-key
-DEFAULT_MODEL=gpt-4o
-
-# Memory
-MEM0_API_KEY=m0-your-mem0-key
-MEMORY_ENABLED=true
-
-# MCP
-GITHUB_PERSONAL_ACCESS_TOKEN=ghp_your_github_token
-NOTION_API_TOKEN=secret_your_notion_token
-
-# RAG
-RAG_ENABLED=true
-```
-
-### Step 5: Run
-
-```bash
-# Development (with hot reload)
-npm run dev
-
-# Production
-npm run build
-npm start
-```
-
-### Expected Output
-
-```
-✅ Database initialized
-✅ Vector store initialized (254 documents)
-✅ Background indexer started
-✅ Memory system initialized
-✅ MCP initialized: github, notion
-✅ Task scheduler started
-✅ Slack app started
-
-Features enabled:
-  • RAG (Semantic Search): ✅
-  • Long-Term Memory: ✅
-  • MCP (GitHub/Notion): ✅ github, notion
-  • Task Scheduler: ✅
-  • AI Model: gpt-4o
-
-Press Ctrl+C to stop
-```
-
----
-
-## ⚙️ Configuration
-
-### Environment Variables
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `SLACK_BOT_TOKEN` | ✅ | - | Bot OAuth token (xoxb-) |
-| `SLACK_APP_TOKEN` | ✅ | - | App-level token (xapp-) |
-| `SLACK_USER_TOKEN` | ❌ | - | User token for reminders |
-| `OPENAI_API_KEY` | ✅ | - | OpenAI API key |
-| `DEFAULT_MODEL` | ❌ | `gpt-4o` | AI model to use |
-| `MEM0_API_KEY` | ❌ | - | mem0 cloud API key |
-| `MEMORY_ENABLED` | ❌ | `true` | Enable memory system |
-| `GITHUB_PERSONAL_ACCESS_TOKEN` | ❌ | - | GitHub token for MCP |
-| `NOTION_API_TOKEN` | ❌ | - | Notion token for MCP |
-| `RAG_ENABLED` | ❌ | `true` | Enable RAG |
-| `RAG_INDEX_INTERVAL_MINUTES` | ❌ | `60` | Index frequency |
-| `LOG_LEVEL` | ❌ | `info` | Log verbosity |
-
-### MCP Configuration (Optional)
-
-Create `mcp-config.json` for custom MCP settings:
-
-```json
-{
-  "servers": [
-    {
-      "name": "github",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "$GITHUB_PERSONAL_ACCESS_TOKEN"
-      }
-    },
-    {
-      "name": "notion",
-      "command": "npx",
-      "args": ["-y", "@notionhq/notion-mcp-server"],
-      "env": {
-        "OPENAPI_MCP_HEADERS": "{\"Authorization\": \"Bearer $NOTION_API_TOKEN\", \"Notion-Version\": \"2022-06-28\"}"
-      }
-    }
-  ]
-}
-```
-
----
-
-## 💡 Usage Examples
-
-### Basic Conversations
-
-```
-User: Hello!
-Bot:  Hi! How can I help you today?
-
-User: What can you do?
-Bot:  I can help with:
-      • Searching Slack history for past discussions
-      • Managing GitHub repos, issues, and PRs
-      • Searching and reading Notion pages
-      • Scheduling messages and reminders
-      • Remembering your preferences
-```
-
-### RAG (Slack Search)
-
-```
-User: What did we discuss about the API last week?
-Bot:  Based on Slack history, here's what was discussed:
-
-      [Oct 15] @john: "The API timeout is set to 30s, should increase"
-      [Oct 16] @jane: "Agreed, let's make it configurable"
-      [Oct 17] @john: "Done, deployed to staging"
-
-      Summary: The team discussed API timeout issues and made it configurable.
-```
-
-### Memory
-
-```
-User: Remember that I prefer Python over JavaScript
-Bot:  ✅ Got it! I'll remember that you prefer Python over JavaScript.
-
-------- Later session -------
-
-User: Write a hello world script
-Bot:  Here's a Python hello world (since you prefer Python):
-      
-      print("Hello, World!")
-```
-
-### MCP (GitHub)
-
-```
-User: List my GitHub repos
-Bot:  Here are your repositories:
-      1. nano-kimi - Learn to build nano-kimi from scratch
-      2. Mixture_of_Experts - MoE implementation
-      3. Machine-Learning-Teach-by-Doing
-      ...
-
-User: Create an issue for the login bug
-Bot:  ✅ Created issue #42 in VizuaraAI/nano-kimi:
-      "Login timeout bug"
-      https://github.com/VizuaraAI/nano-kimi/issues/42
-```
-
-### MCP (Notion)
-
-```
-User: Search Notion for project roadmap
-Bot:  Found 3 pages matching "project roadmap":
-      1. Q4 Product Roadmap (last edited 2 days ago)
-      2. Engineering Roadmap 2024
-      3. Roadmap Template
-
-      Would you like me to get the content of any of these?
-```
-
-### Combined (RAG + Memory + MCP)
-
-```
-User: Remember my GitHub is VizuaraAI. Search Slack for bugs we 
-      discussed, then create issues for them.
-
-Bot:  ✅ I'll remember your GitHub username.
-      
-      Searching Slack for bug discussions...
-      Found 10 relevant messages.
-      
-      Creating GitHub issues:
-      • #42: Login timeout bug (from Oct 5 discussion)
-      • #43: API caching issue (from Oct 12 discussion)
-      
-      Created 2 issues in VizuaraAI/nano-kimi!
-```
-
----
-
-## 🔧 Available Tools
-
-### Slack Tools (12)
-
-| Tool | Description |
+| File | What it does |
 |------|-------------|
-| `search_knowledge_base` | Semantic search across indexed Slack messages |
-| `send_message` | Send message to channel or user |
-| `get_channel_history` | Get recent messages from a channel |
-| `schedule_message` | Schedule one-time message |
-| `schedule_recurring_message` | Schedule recurring message |
-| `set_reminder` | Set a reminder |
-| `list_channels` | List all channels |
-| `list_users` | List all users |
-| `get_my_memories` | Show stored memories |
-| `remember_this` | Explicitly store a fact |
-| `forget_about` | Delete specific memories |
-| `forget_everything` | Delete all memories |
+| [src/mcp/client.ts](src/mcp/client.ts) | Spawns MCP server processes and routes tool calls to them |
+| [src/mcp/config.ts](src/mcp/config.ts) | Loads which MCP servers to start from config |
+| [src/mcp/tool-converter.ts](src/mcp/tool-converter.ts) | Converts MCP tool definitions into OpenAI function calling format |
 
-### GitHub Tools via MCP (26)
-
-| Tool | Description |
-|------|-------------|
-| `github_search_repositories` | Search for repos |
-| `github_get_repository` | Get repo details |
-| `github_list_issues` | List issues |
-| `github_create_issue` | Create new issue |
-| `github_get_issue` | Get issue details |
-| `github_update_issue` | Update issue |
-| `github_list_pull_requests` | List PRs |
-| `github_create_pull_request` | Create PR |
-| `github_get_file_contents` | Read file from repo |
-| `github_search_code` | Search code |
-| ... and 16 more |
-
-### Notion Tools via MCP (21)
-
-| Tool | Description |
-|------|-------------|
-| `notion_search` | Search all pages |
-| `notion_get_page` | Get page content |
-| `notion_create_page` | Create new page |
-| `notion_update_page` | Update page |
-| `notion_query_database` | Query database |
-| `notion_create_database` | Create database |
-| ... and 15 more |
+**What clicked for me:** MCP is just a standardized way to run tools as separate processes. The benefit is that adding a new tool (say, a Jira integration) means pointing to a new MCP server. The core of mini ClawBot stays untouched.
 
 ---
 
-## 📁 Project Structure
+## How mini ClawBot Handles One Message (The Full Flow)
+
+Once I understood the three systems, I traced through what happens when a single message arrives:
 
 ```
-slack-ai-assistant-v2/
+Step 1: Slack sends the message event to mini ClawBot
+        mini ClawBot checks if the user is allowed to interact
+        It adds a 👀 reaction so the user knows it received the message
+
+Step 2: Memory retrieval
+        mini ClawBot queries mem0 with the user ID and message
+        Gets back any relevant stored facts about this user
+
+Step 3: RAG check
+        mini ClawBot looks for keywords suggesting the user wants to search history
+        If found: embeds the query, searches ChromaDB, retrieves matching Slack messages
+
+Step 4: Assemble the full LLM context
+        System prompt
+        + Memory facts (if any)
+        + RAG results (if any)
+        + Last 10 messages from this session
+        + Current user message
+        + All 59 tool definitions
+
+Step 5: Call the LLM (GPT-4o)
+        If the LLM returns tool calls: execute them, add results, call LLM again
+        This loop continues until the LLM gives a final text response
+
+Step 6: Send the reply to Slack
+        Remove the 👀 reaction
+        Post the response (threaded if needed)
+
+Step 7: Store new memories (background, async)
+        Send the conversation to mem0
+        mem0 extracts and stores any new facts
+```
+
+This is all wired together in [src/agents/agent.ts](src/agents/agent.ts) and [src/channels/slack.ts](src/channels/slack.ts).
+
+---
+
+## Project Structure (How the Code Is Organised)
+
+```
+Slack-ClawdBot/
 ├── src/
-│   ├── index.ts                 # Main entry point
+│   ├── index.ts                 # Boots everything in order: DB → RAG → Memory → MCP → Slack
 │   ├── config/
-│   │   └── index.ts             # Configuration loading
+│   │   └── index.ts             # Reads and validates all environment variables using Zod
 │   ├── channels/
-│   │   └── slack.ts             # Slack event handlers
+│   │   └── slack.ts             # Listens for Slack events and triggers the agent
 │   ├── agents/
-│   │   └── agent.ts             # AI agent + tool orchestration
+│   │   └── agent.ts             # The brain: assembles context, runs the tool loop, returns response
 │   ├── memory/
-│   │   └── database.ts          # SQLite for sessions
+│   │   └── database.ts          # SQLite database for sessions and conversation history
 │   ├── memory-ai/
-│   │   ├── index.ts             # Memory exports
-│   │   └── mem0-client.ts       # mem0 integration
+│   │   ├── index.ts             # Memory system exports
+│   │   └── mem0-client.ts       # mem0 cloud API integration
 │   ├── rag/
-│   │   ├── index.ts             # RAG exports
-│   │   ├── vectorstore.ts       # ChromaDB storage
-│   │   ├── embeddings.ts        # OpenAI embeddings
-│   │   ├── indexer.ts           # Background indexer
-│   │   └── retriever.ts         # Semantic search
+│   │   ├── index.ts             # RAG system exports
+│   │   ├── vectorstore.ts       # ChromaDB read/write
+│   │   ├── embeddings.ts        # OpenAI embedding API calls
+│   │   ├── indexer.ts           # Background job: fetch Slack messages and embed them
+│   │   └── retriever.ts         # Semantic search at query time
 │   ├── mcp/
-│   │   ├── index.ts             # MCP exports
-│   │   ├── client.ts            # MCP client manager
-│   │   ├── config.ts            # MCP configuration
-│   │   └── tool-converter.ts    # MCP → OpenAI tool format
+│   │   ├── index.ts             # MCP system exports
+│   │   ├── client.ts            # Spawns MCP servers and routes tool calls
+│   │   ├── config.ts            # MCP server configuration loader
+│   │   └── tool-converter.ts    # Translates MCP tool format into OpenAI function format
 │   ├── tools/
-│   │   ├── slack-actions.ts     # Slack API wrappers
-│   │   └── scheduler.ts         # Task scheduler
+│   │   ├── slack-actions.ts     # Wrappers for Slack API calls
+│   │   └── scheduler.ts         # Cron job manager for scheduled messages
 │   └── utils/
 │       └── logger.ts            # Winston logger
-├── data/                        # Local data (gitignored)
-│   └── vectorstore/             # ChromaDB files
 ├── docs/
-│   ├── ARCHITECTURE.md          # Architecture details
-│   ├── RAG.md                   # RAG documentation
-│   ├── MEMORY.md                # Memory documentation
-│   └── MCP.md                   # MCP documentation
+│   ├── ARCHITECTURE.md          # Deeper architecture notes
+│   ├── RAG.md                   # RAG system details
+│   ├── MEMORY.md                # Memory system details
+│   └── MCP.md                   # MCP integration details
 ├── scripts/
-│   ├── setup-db.ts              # Database setup
-│   └── run-indexer.ts           # Manual indexing
-├── .env.example                 # Environment template
-├── mcp-config.example.json      # MCP config template
-├── package.json
-├── tsconfig.json
-└── README.md
+│   ├── setup-db.ts              # Sets up the SQLite schema
+│   └── run-indexer.ts           # Manually triggers a Slack re-index
+├── .env.example                 # Template showing all required environment variables
+├── mcp-config.example.json      # Template for MCP server configuration
+├── Dockerfile
+├── docker-compose.yml
+└── package.json
 ```
 
 ---
 
-## 🐛 Troubleshooting
+## Running mini ClawBot Yourself
 
-### Common Issues
+If you want to run mini ClawBot to see it in action, here is what you need.
 
-#### "MCP server not connected"
+### What you need first
 
-```bash
-# Check if tokens are set
-echo $GITHUB_PERSONAL_ACCESS_TOKEN
-echo $NOTION_API_TOKEN
+- Node.js 18+
+- A Slack workspace with admin access
+- An OpenAI API key
+- GitHub Personal Access Token (for GitHub tools)
+- Notion Integration Token (for Notion tools)
+- mem0 API key (for memory)
 
-# Test GitHub token
-curl -H "Authorization: token $GITHUB_PERSONAL_ACCESS_TOKEN" https://api.github.com/user
-```
-
-#### "RAG returns 0 results"
-
-```bash
-# Check indexed document count in logs
-# Should see: "Vector store initialized (254 documents)"
-
-# Invite bot to more channels
-/invite @YourBotName
-
-# Restart to re-index
-npm run dev
-```
-
-#### "Memory not working"
-
-```
-# Check for this warning in logs:
-"Failed to initialize client: ReferenceError: window is not defined"
-
-# This is a known mem0 package issue - memory still works via API
-```
-
-#### "Bot not responding in channels"
-
-1. Ensure bot is mentioned: `@BotName your message`
-2. Check bot is invited to the channel
-3. Check `ALLOWED_CHANNELS` in config
-
-#### "Tool not being used"
-
-The LLM decides when to use tools. Be explicit:
-```
-❌ "What repos do I have?"
-✅ "Use GitHub to list my repositories"
-✅ "Search my GitHub repos for VizuaraAI"
-```
-
-### Debug Mode
-
-Enable verbose logging:
-```env
-LOG_LEVEL=debug
-```
-
-### Logs to Check
-
-```
-# Startup
-✅ MCP initialized: github, notion     # MCP working
-✅ Vector store initialized (254 docs) # RAG working
-✅ Memory system initialized           # Memory working
-
-# Message processing
-Total tools available: 59 (12 Slack + 47 MCP)  # All tools loaded
-Executing tool: github_create_issue            # Tool being called
-Executing MCP tool: github/create_issue        # MCP routing
-Stored 1 memories for user U050Y4SNQF3         # Memory saving
-```
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/amazing-feature`
-3. Commit changes: `git commit -m 'Add amazing feature'`
-4. Push to branch: `git push origin feature/amazing-feature`
-5. Open a Pull Request
-
-### Development
+### Setup
 
 ```bash
 # Install dependencies
 npm install
 
-# Run in development mode
-npm run dev
+# Copy the environment template
+cp .env.example .env
+```
 
-# Type checking
-npm run typecheck
+Fill in `.env`:
 
-# Linting
-npm run lint
+```env
+SLACK_BOT_TOKEN=xoxb-your-bot-token
+SLACK_APP_TOKEN=xapp-your-app-token
+SLACK_USER_TOKEN=xoxp-your-user-token
+
+OPENAI_API_KEY=sk-your-openai-key
+DEFAULT_MODEL=gpt-4o
+
+MEM0_API_KEY=m0-your-mem0-key
+MEMORY_ENABLED=true
+
+GITHUB_PERSONAL_ACCESS_TOKEN=ghp_your-github-token
+NOTION_API_TOKEN=secret_your-notion-token
+
+RAG_ENABLED=true
+```
+
+### Run
+
+```bash
+npm run dev        # Development with hot reload
+npm run build && npm start   # Production
+docker-compose up -d         # Docker
+```
+
+### What a healthy startup looks like
+
+```
+✅ Database initialized
+✅ Vector store initialized
+✅ Background indexer started
+✅ Memory system initialized
+✅ MCP initialized: github, notion
+✅ Task scheduler started
+✅ Slack app started
 ```
 
 ---
 
-## 📄 License
+## All 59 Tools mini ClawBot Has Access To
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+### Slack Tools (12, built in)
+
+| Tool | Purpose |
+|------|---------|
+| `search_knowledge_base` | Semantic search over indexed Slack messages |
+| `send_message` | Send a message to a channel or user |
+| `get_channel_history` | Fetch recent messages from a channel |
+| `schedule_message` | Schedule a one-time future message |
+| `schedule_recurring_message` | Set up a recurring message |
+| `set_reminder` | Set a Slack reminder |
+| `list_channels` | List all channels mini ClawBot can see |
+| `list_users` | List all workspace users |
+| `get_my_memories` | Show what mini ClawBot remembers about you |
+| `remember_this` | Save a fact to memory manually |
+| `forget_about` | Delete a specific memory |
+| `forget_everything` | Clear all memories for your user |
+
+### GitHub Tools via MCP (26)
+
+Search repos, get repo info, list and create issues, list and create pull requests, read file contents from repos, search code, and more.
+
+### Notion Tools via MCP (21)
+
+Search pages and databases, read page content, create and update pages, query and create databases, and more.
 
 ---
 
-## 🙏 Acknowledgments
+## Concepts I Now Understand Better
 
-- [Slack Bolt.js](https://slack.dev/bolt-js/) - Slack app framework
-- [OpenAI](https://openai.com/) - LLM and embeddings
-- [mem0](https://mem0.ai/) - Long-term memory
-- [Model Context Protocol](https://modelcontextprotocol.io/) - Tool integration standard
-- [ChromaDB](https://www.trychroma.com/) - Vector database
+After going through this codebase, these ideas became much clearer to me:
+
+**Tool use / function calling:** The LLM does not execute tools itself. It returns a JSON object saying "call this function with these arguments." mini ClawBot executes it and feeds the result back. This loop is the engine behind most agentic AI systems.
+
+**Vector similarity search:** Two texts with similar meaning have similar vector representations. That is why RAG can find relevant Slack messages even when the user's query uses different words.
+
+**Async memory writes:** mini ClawBot stores memories after the reply is sent, not before. This means the user gets a fast response. Memory extraction is a background task.
+
+**MCP as a plugin system:** MCP is basically a standardized way to run tools as separate processes. It decouples the bot from the tool implementations. You could swap out or add MCP servers without touching mini ClawBot's core logic.
+
+**Zod for config validation:** mini ClawBot validates all environment variables at startup using Zod schemas. If something is missing or wrong, it fails fast with a clear error instead of breaking mid-conversation.
+
+**Barrel `index.ts` files:** Each subsystem has an `index.ts` that re-exports only what the rest of the app needs. This keeps internal implementation details hidden and makes imports clean.
 
 ---
 
-<p align="center">
-  Built with ❤️ for productive Slack workspaces
-</p>
+## What I Want to Study Next
+
+- [ ] Read [src/agents/agent.ts](src/agents/agent.ts) more carefully to understand exactly how the tool loop is implemented
+- [ ] Understand the SQLite session schema in [src/memory/database.ts](src/memory/database.ts)
+- [ ] Read [docs/RAG.md](docs/RAG.md) for deeper notes on the RAG pipeline
+- [ ] Try swapping GPT-4o for Claude (Anthropic) as the primary model
+- [ ] Understand the pairing code system that controls who can DM mini ClawBot
+- [ ] Experiment with changing `RAG_MIN_SIMILARITY` to see how it affects result quality
+
+---
+
+## Resources
+
+- [Slack Bolt.js Docs](https://slack.dev/bolt-js/) - The framework mini ClawBot uses to listen for Slack events
+- [OpenAI Function Calling Guide](https://platform.openai.com/docs/guides/function-calling) - How the tool loop works at the API level
+- [mem0 Documentation](https://docs.mem0.ai/) - The memory service mini ClawBot uses
+- [Model Context Protocol Docs](https://modelcontextprotocol.io/) - The MCP standard
+- [ChromaDB Docs](https://docs.trychroma.com/) - The vector database mini ClawBot uses for RAG
+
+---
+
+## Credits
+
+mini ClawBot was originally built by [Vizuara AI Labs](https://www.youtube.com/@vizuara). I studied this codebase to learn how production-grade Slack bots are built using RAG, long-term memory, and tool orchestration. All credit for the original architecture and implementation goes to the Vizuara team.
+
+
+---
+
+This is a personal learning notebook. 
