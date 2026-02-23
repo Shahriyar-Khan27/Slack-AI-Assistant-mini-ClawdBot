@@ -1,4 +1,4 @@
-# Learning How mini ClawBot Works
+# Learning How ClawBot Works
 
 This is my personal notebook for understanding how mini ClawBot is built. mini ClawBot is a Slack AI assistant that goes far beyond a basic chatbot. It can search through past Slack conversations, remember who you are across sessions, and take real actions on GitHub and Notion.
 
